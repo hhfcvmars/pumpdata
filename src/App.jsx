@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as XLSX from 'xlsx-js-style'
 import { saveAs } from 'file-saver'
 import './App.css'
@@ -153,6 +153,7 @@ const DEVICE_EVENT_BASE_OPTIONS = [
   { code: 0x050400, label: '泵充电状态' },
   { code: 0x030100, label: '闭环基础率达到上限' },
   { code: 0x030200, label: '自动暂停基础率输注' },
+  { code: 0x030300, label: '自动基础率为0达到4小时' },
   { code: 0x030500, label: '目标血糖改变' },
   { code: 0x030600, label: '自动基础率为0达到4小时' },
   { code: 0x030700, label: '闭环模式改变' },
@@ -163,6 +164,7 @@ const DEVICE_EVENT_BASE_OPTIONS = [
   { code: 0x040601, label: '泵体即将关机！' },
   { code: 0x050001, label: '泵电量低！' },
   { code: 0x050201, label: '泵按键故障！' },
+  { code: 0x050300, label: '进入强磁场，泵体可能失效' },
   { code: 0x050301, label: '进入强磁场，泵体可能失效！' },
   { code: 0x030101, label: '短期达到最大输注量，自动模式已退出!' },
   { code: 0x030201, label: '自动暂停基础率时间过长，自动模式已退出!' },
@@ -555,6 +557,7 @@ const buildRowModel = (item, index) => {
     current: { ...baseValues },
     deleted: deleteFlag === 1,
     added: deleteFlag === 2,
+    importModified: deleteFlag === 3,
   }
 }
 
@@ -573,6 +576,19 @@ const parseDateTimeToMs = (value) => {
     return Number.isNaN(parsed) ? Number.NaN : parsed
   }
   return Number.NaN
+}
+
+const getPreferredDateTimeValue = (item, current) => {
+  const editedDeviceTime =
+    typeof current?.deviceTime === 'string'
+      ? current.deviceTime.trim()
+      : current?.deviceTime
+
+  if (editedDeviceTime) {
+    return editedDeviceTime
+  }
+
+  return item?.datetime ?? item?.time ?? item?.DEVICE_TIME ?? item?.createTime ?? ''
 }
 
 const formatDuration = (ms) => {
@@ -768,6 +784,12 @@ function App() {
   // expandedDeletedRows 记录被用户手动展开的已删除行
   const [expandedDeletedRows, setExpandedDeletedRows] = useState(new Set())
 
+  // 持久化编辑存储：key = _stableIdx, value = { current, deleted, importModified }
+  // 跨日期筛选保留编辑状态
+  const editsStoreRef = useRef(new Map())
+  // 持久化新增行存储：跨日期筛选保留新增行
+  const addedRowsStoreRef = useRef([])
+
   const closeModal = useCallback(() => {
     setIsModalOpen(false)
     setModalError('')
@@ -779,6 +801,39 @@ function App() {
       setCurrentPage(maxPage)
     }
   }, [rows, currentPage])
+
+  // 每次 rows 变化时，同步编辑状态到持久化存储
+  // 注意：只增量更新，不清理已有条目（清理由 reset 操作显式执行）
+  useEffect(() => {
+    const store = editsStoreRef.current
+    const addedStore = addedRowsStoreRef.current
+
+    // 重新收集新增行
+    addedStore.length = 0
+
+    for (const row of rows) {
+      if (row.added) {
+        addedStore.push(row)
+        continue
+      }
+      const idx = row.source?._stableIdx
+      if (idx === undefined) continue
+
+      const hasEdits = row.importModified ||
+        row.deleted ||
+        EDITABLE_COLUMNS.some((col) => row.current[col.key] !== row.original[col.key])
+
+      if (hasEdits) {
+        store.set(idx, {
+          original: { ...row.original },
+          current: { ...row.current },
+          deleted: row.deleted,
+          importModified: row.importModified || false,
+        })
+      }
+      // 不再自动删除：只有显式还原操作才清理 store
+    }
+  }, [rows])
 
   const paginatedRows = useMemo(() => {
     const start = (currentPage - 1) * PAGE_SIZE
@@ -949,13 +1004,23 @@ function App() {
     []
   )
 
+  const isRowModified = useCallback(
+    (row) =>
+      row.importModified ||
+      EDITABLE_COLUMNS.some((column) => {
+        const key = column.key
+        return row.current[key] !== row.original[key]
+      }),
+    []
+  )
+
   const buildExportRecord = useCallback(
     (row) => {
       const updatedSource = buildUpdatedSource(row)
       const record = {}
       EXPORT_FIELD_ORDER.forEach((field) => {
         if (field === 'delete') {
-          record.delete = row.added ? 2 : row.deleted ? 1 : 0
+          record.delete = row.added ? 2 : row.deleted ? 1 : isRowModified(row) ? 3 : 0
         } else if (field === 'originalDatetime') {
           // 保存原始时间字段，用于后端对比
           const originalTime =
@@ -969,7 +1034,7 @@ function App() {
       })
       return record
     },
-    [buildUpdatedSource]
+    [buildUpdatedSource, isRowModified]
   )
 
   const buildExportAllRecord = useCallback(
@@ -1002,7 +1067,7 @@ function App() {
 
       EXPORT_ALL_FIELD_ORDER.forEach((field) => {
         if (field === 'delete') {
-          record.delete = row.added ? 2 : row.deleted ? 1 : 0
+          record.delete = row.added ? 2 : row.deleted ? 1 : isRowModified(row) ? 3 : 0
         } else if (field === 'deviceEventLabel') {
           record.deviceEventLabel = getDeviceEventLabel(eventCandidate)
         } else if (field === 'bolusTotal') {
@@ -1020,16 +1085,7 @@ function App() {
 
       return record
     },
-    [buildUpdatedSource]
-  )
-
-  const isRowModified = useCallback(
-    (row) =>
-      EDITABLE_COLUMNS.some((column) => {
-        const key = column.key
-        return row.current[key] !== row.original[key]
-      }),
-    []
+    [buildUpdatedSource, isRowModified]
   )
 
   const summary = useMemo(() => {
@@ -1060,6 +1116,9 @@ function App() {
     [rows, isRowModified]
   )
 
+  // 导出 JSON 用：包含所有变更（修改、新增、删除）
+  const exportableRows = changedRows
+
   const exportStats = useMemo(() => {
     const deleted = changedRows.filter((row) => row.deleted).length
     const added = changedRows.filter((row) => row.added).length
@@ -1068,7 +1127,6 @@ function App() {
       deleted,
       added,
       modified: changedRows.length - deleted - added,
-      modified: changedRows.length - deleted,
     }
   }, [changedRows])
 
@@ -1091,6 +1149,8 @@ function App() {
       setIsModalOpen(false)
       setSourceFileBase('')
       setSourceFileExtension('json')
+      editsStoreRef.current.clear()
+      addedRowsStoreRef.current.length = 0
       return
     }
 
@@ -1111,6 +1171,8 @@ function App() {
     setError('')
     setSelectedFileName(sourceLabel)
     setModalError('')
+    editsStoreRef.current.clear()
+    addedRowsStoreRef.current.length = 0
     if (fileBaseName) {
       setSourceFileBase(fileBaseName)
     } else if (!sourceFileBase) {
@@ -1157,6 +1219,13 @@ function App() {
 
     setSourceItems(filteredValues)
 
+    // 给每个 sourceItem 打上稳定索引标记，用于跨筛选匹配编辑状态
+    filteredValues.forEach((item, i) => {
+      if (item._stableIdx === undefined) {
+        item._stableIdx = i
+      }
+    })
+
     if (autoApply) {
       const enrichedValues = applyBolusCalculations(filteredValues)
       setCurrentPage(1)
@@ -1199,15 +1268,56 @@ function App() {
 
     setIsLoading(true)
     window.requestAnimationFrame(() => {
+      const store = editsStoreRef.current
+      const addedStore = addedRowsStoreRef.current
+
       const filtered = sourceItems.filter((item) => {
+        const idx = item?._stableIdx
+        const saved = idx !== undefined ? store.get(idx) : undefined
+        // 只要有变更，就始终保留在当前表格中，不受日期范围限制
+        if (saved) {
+          return true
+        }
         const timestamp = parseDateTimeToMs(
-          item?.datetime ?? item?.time ?? item?.DEVICE_TIME ?? item?.createTime
+          getPreferredDateTimeValue(item, saved?.current)
         )
         if (!Number.isFinite(timestamp)) return false
         return timestamp >= startMs && timestamp <= endMs
       })
 
-      if (!filtered.length) {
+      const enrichedValues = filtered.length ? applyBolusCalculations(filtered) : []
+
+      // 构建新行，从持久化存储恢复编辑状态
+      const newRows = enrichedValues.map((item, index) => {
+        const row = buildRowModel(item, index)
+        const idx = item?._stableIdx
+        if (idx !== undefined && store.has(idx)) {
+          const saved = store.get(idx)
+          // 用保存的 original 来保证 current vs original 的差异能被检测到
+          return {
+            ...row,
+            original: { ...saved.original },
+            current: { ...saved.current },
+            deleted: saved.deleted,
+            importModified: saved.importModified,
+          }
+        }
+        return row
+      })
+
+      // 将新增行插回（如果其时间在新的筛选范围内）
+      for (const addedRow of addedStore) {
+        const parentIdx = newRows.findIndex(
+          (r) => r.sourceId === addedRow.sourceId
+        )
+        if (parentIdx !== -1) {
+          newRows.splice(parentIdx + 1, 0, { ...addedRow, id: nextRowUid() })
+        } else {
+          newRows.push({ ...addedRow, id: nextRowUid() })
+        }
+      }
+
+      if (!newRows.length) {
         setRows([])
         setError('选定日期范围内没有数据，请调整日期后再试。')
         setModalError('选定日期范围内没有数据，请调整日期后再试。')
@@ -1215,9 +1325,8 @@ function App() {
         return
       }
 
-      const enrichedValues = applyBolusCalculations(filtered)
       setCurrentPage(1)
-      setRows(enrichedValues.map(buildRowModel))
+      setRows(recalcDerived(newRows))
       setError('')
       setModalError('')
       closeModal()
@@ -1393,11 +1502,22 @@ function App() {
   )
 
   const toggleDeleteRow = useCallback((rowId) => {
-    setRows((currentRows) =>
-      currentRows.map((row) =>
+    setRows((currentRows) => {
+      const target = currentRows.find((row) => row.id === rowId)
+      if (!target) return currentRows
+      // 新增行直接从列表中移除，不做软删除
+      if (target.added) {
+        const next = currentRows.filter((row) => row.id !== rowId)
+        // 同步清理持久化新增行存储
+        const addedStore = addedRowsStoreRef.current
+        const idx = addedStore.findIndex((r) => r.id === rowId)
+        if (idx !== -1) addedStore.splice(idx, 1)
+        return recalcDerived(next)
+      }
+      return currentRows.map((row) =>
         row.id === rowId ? { ...row, deleted: !row.deleted } : row
       )
-    )
+    })
     // 取消删除时，从展开集合中移除
     setExpandedDeletedRows((prev) => {
       if (!prev.has(rowId)) return prev
@@ -1461,8 +1581,6 @@ function App() {
         deviceSn: s.deviceSn ?? c.deviceSn ?? '',
       }
     })
-
-    const enriched = applyBolusCalculations(items)
 
     // 按时间排序后的 enriched 需要映射回原始行顺序
     // applyBolusCalculations 内部会排序，所以用 datetime 和 index 做匹配
@@ -1552,11 +1670,52 @@ function App() {
     }))
   }
 
+  const buildAllRowsForExport = useCallback(() => {
+    if (!sourceItems.length) return []
+
+    const store = editsStoreRef.current
+    const addedStore = addedRowsStoreRef.current
+
+    const allRows = applyBolusCalculations(sourceItems).map((item, index) => {
+      const row = buildRowModel(item, index)
+      const idx = item?._stableIdx
+
+      if (idx !== undefined && store.has(idx)) {
+        const saved = store.get(idx)
+        return {
+          ...row,
+          original: { ...saved.original },
+          current: { ...saved.current },
+          deleted: saved.deleted,
+          importModified: saved.importModified,
+        }
+      }
+
+      return row
+    })
+
+    for (const addedRow of addedStore) {
+      const clonedAddedRow = { ...addedRow, id: nextRowUid() }
+      const parentIdx = allRows.findIndex((row) => row.sourceId === addedRow.sourceId)
+      if (parentIdx !== -1) {
+        allRows.splice(parentIdx + 1, 0, clonedAddedRow)
+      } else {
+        allRows.push(clonedAddedRow)
+      }
+    }
+
+    return recalcDerived(allRows)
+  }, [sourceItems])
+
   const resetRowChanges = useCallback((rowId) => {
     setRows((currentRows) => {
       const target = currentRows.find((row) => row.id === rowId)
       if (target?.added) {
         return currentRows.filter((row) => row.id !== rowId)
+      }
+      // 从持久化存储中移除该行的编辑
+      if (target?.source?._stableIdx !== undefined) {
+        editsStoreRef.current.delete(target.source._stableIdx)
       }
       return currentRows.map((row) =>
         row.id === rowId
@@ -1564,6 +1723,7 @@ function App() {
               ...row,
               current: { ...row.original },
               deleted: false,
+              importModified: false,
             }
           : row
       )
@@ -1571,69 +1731,22 @@ function App() {
   }, [])
 
   const resetAllChanges = useCallback(() => {
+    editsStoreRef.current.clear()
+    addedRowsStoreRef.current.length = 0
     setRows((currentRows) =>
       currentRows.map((row) => ({
         ...row,
         current: { ...row.original },
         deleted: false,
+        importModified: false,
       }))
     )
     setError('')
   }, [setError])
 
-  const exportToExcel = useCallback(
-    (baseNameOverride) => {
-      if (!changedRows.length) return false
-
-      const baseInput = baseNameOverride || sourceFileBase || 'pump-history'
-      const baseName = baseInput.replace(/\s+/g, '_')
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[:T]/g, '-')
-      .slice(0, 19)
-
-      const sheetData = changedRows.map((row) => buildExportRecord(row))
-      const headers = EXPORT_FIELD_ORDER
-
-      const worksheet = XLSX.utils.json_to_sheet(sheetData, {
-        header: headers,
-        skipHeader: false,
-      })
-      const workbook = XLSX.utils.book_new()
-      XLSX.utils.book_append_sheet(workbook, worksheet, 'PumpHistory')
-      XLSX.writeFile(workbook, `${baseName}-${timestamp}.xlsx`)
-      return true
-    },
-    [changedRows, sourceFileBase, buildExportRecord]
-  )
-
   const exportToJson = useCallback(
     (baseNameOverride) => {
-      if (!changedRows.length) return false
-
-      const baseInput = baseNameOverride || sourceFileBase || 'pump-history'
-      const baseName = baseInput.replace(/\s+/g, '_')
-      const extension = (sourceFileExtension || 'json').replace(/^\.+/, '')
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[:T]/g, '-')
-      .slice(0, 19)
-
-      const exportPayload = changedRows.map((row) => buildExportRecord(row))
-
-      const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
-        type: 'application/json',
-      })
-
-      saveAs(blob, `${baseName}-${timestamp}.${extension}`)
-      return true
-    },
-    [changedRows, sourceFileBase, sourceFileExtension, buildExportRecord]
-  )
-
-  const exportAllToExcel = useCallback(
-    (baseNameOverride) => {
-      if (!rows.length) return false
+      if (!exportableRows.length) return false
 
       const baseInput = baseNameOverride || sourceFileBase || 'pump-history'
       const baseName = baseInput.replace(/\s+/g, '_')
@@ -1642,11 +1755,37 @@ function App() {
         .replace(/[:T]/g, '-')
         .slice(0, 19)
 
-      const sheetData = rows.map((row) => buildExportAllRecord(row))
+      const exportPayload = exportableRows.map((row) => buildExportRecord(row))
+
+      const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
+        type: 'application/json',
+      })
+
+      saveAs(blob, `${baseName}-${timestamp}.json`)
+      return true
+    },
+    [exportableRows, sourceFileBase, buildExportRecord]
+  )
+
+  const exportAllToExcel = useCallback(
+    (baseNameOverride) => {
+      const exportRows = buildAllRowsForExport()
+      if (!exportRows.length) return false
+
+      const baseInput = baseNameOverride || sourceFileBase || 'pump-history'
+      const baseName = baseInput.replace(/\s+/g, '_')
+      const timestamp = new Date()
+        .toISOString()
+        .replace(/[:T]/g, '-')
+        .slice(0, 19)
+
+      const sheetData = exportRows.map((row) => buildExportAllRecord(row))
       const headers = EXPORT_ALL_FIELD_ORDER
 
-      // 1) 最终版 — 无颜色标记
-      const wsFinal = XLSX.utils.json_to_sheet(sheetData, {
+      // 1) 最终版 — 排除已删除的行，无颜色标记
+      const finalRows = exportRows.filter((row) => !row.deleted)
+      const finalSheetData = finalRows.map((row) => buildExportAllRecord(row))
+      const wsFinal = XLSX.utils.json_to_sheet(finalSheetData, {
         header: headers,
         skipHeader: false,
       })
@@ -1660,8 +1799,8 @@ function App() {
         skipHeader: false,
       })
       const colCount = headers.length
-      for (let r = 0; r < rows.length; r++) {
-        const row = rows[r]
+      for (let r = 0; r < exportRows.length; r++) {
+        const row = exportRows[r]
         const modified = isRowModified(row)
         let bgColor = null
         if (row.added) bgColor = 'C6EFCE'
@@ -1685,7 +1824,7 @@ function App() {
 
       return true
     },
-    [rows, sourceFileBase, buildExportAllRecord, isRowModified]
+    [buildAllRowsForExport, sourceFileBase, buildExportAllRecord, isRowModified]
   )
 
   const openExportModal = useCallback(() => {
@@ -1699,12 +1838,11 @@ function App() {
 
   const handleConfirmExport = useCallback(() => {
     const baseInput = exportFileName.trim() || sourceFileBase || 'pump-history'
-    const hasExcel = exportToExcel(baseInput)
-    const hasJson = exportToJson(baseInput)
-    if (hasExcel || hasJson) {
+    const success = exportToJson(baseInput)
+    if (success) {
       setIsExportModalOpen(false)
     }
-  }, [exportFileName, sourceFileBase, exportToExcel, exportToJson])
+  }, [exportFileName, sourceFileBase, exportToJson])
 
   const openExportAllModal = useCallback(() => {
     setExportAllFileName(sourceFileBase || 'pump-history')
@@ -1811,7 +1949,7 @@ function App() {
           onClick={() => openExportModal()}
           disabled={!rows.length}
         >
-          导出 Excel + JSON
+          导出变更 JSON
         </button>
       </section>
 
@@ -2048,7 +2186,7 @@ function App() {
         <div className="modal-overlay">
           <div className="modal-content wide">
             <div className="modal-header">
-              <h2>导出确认</h2>
+              <h2>导出变更 JSON</h2>
               <button
                 type="button"
                 className="modal-close"
@@ -2072,7 +2210,7 @@ function App() {
               />
             </label>
             <div className="export-preview">
-              {changedRows.length ? (
+              {exportableRows.length ? (
                 <table className="preview-table">
                   <thead>
                     <tr>
@@ -2088,7 +2226,7 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {changedRows.map((row) => {
+                    {exportableRows.map((row) => {
                       const statusLabel = row.added ? '新增' : row.deleted ? '删除' : '修改'
                       return (
                         <tr key={`export-${row.id}`}>
@@ -2132,7 +2270,7 @@ function App() {
                   </tbody>
                 </table>
               ) : (
-                <div className="empty-export">暂无修改或删除的数据。</div>
+                <div className="empty-export">暂无变更数据。</div>
               )}
             </div>
             <div className="modal-actions">
@@ -2147,7 +2285,7 @@ function App() {
                 type="button"
                 className="modal-button primary"
                 onClick={handleConfirmExport}
-                disabled={!changedRows.length}
+                disabled={!exportableRows.length}
               >
                 确认导出
               </button>
@@ -2319,6 +2457,11 @@ function App() {
                           : column.key === 'deviceTime'
                             ? formatDeviceTimeDisplay(rawValue)
                             : rawValue
+                      // datetime-local 输入框需要 T 分隔的格式，不能用 display 格式
+                      const inputDateTimeValue =
+                        column.key === 'deviceTime'
+                          ? toInputDateTime(rawValue) || rawValue
+                          : undefined
 
                       const cellClass =
                         [
@@ -2348,7 +2491,7 @@ function App() {
                           {column.key === 'deviceTime' ? (
                             <input
                               type="datetime-local"
-                              value={displayValue}
+                              value={inputDateTimeValue}
                               step="1"
                               onChange={(event) =>
                                 handleCellChange(
